@@ -37,3 +37,11 @@ Dies ist der lokale Entwicklungsstand. Vor einem öffentlichen Produktivbetrieb 
 Produktdaten und Produktbilder: Honig-Kiste (https://honig-kiste.de). Betreiberangaben: Der Bienenladen / OÖ. Landesverband für Bienenzucht. Logo: vom Betreiber bereitgestellt. Diese Inhalte sind nicht durch eine allgemeine Open-Source-Lizenz dieses Repositorys freigegeben.
 
 Manrope und Work Sans werden lokal eingebunden. Die jeweiligen SIL Open Font Licenses liegen unter `static/fonts/`.
+
+## Produktivbetrieb
+
+Für den Produktivbetrieb wird die Anwendung hinter einem HTTPS-Reverse-Proxy als isolierter Dienst betrieben. Die Betriebsdateien und Zugangsdaten werden separat auf dem Server verwaltet.
+
+Der Produktionsmodus sperrt Bestelllisten, Mollie-Einstellungen und Simulator. Der Bestellstatus ist nur mit einem signierten Zugriffstoken abrufbar und enthält keine Adressdaten. Ohne passenden Live-Schlüssel bleibt der Checkout gesperrt.
+
+Sicherheitsprüfungen: `python3 -m unittest discover -s tests -v`.

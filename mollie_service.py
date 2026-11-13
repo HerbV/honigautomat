@@ -6,6 +6,7 @@ interaktiven lokalen Mollie Hosted Checkout Simulator für sofortiges Testen.
 
 import os
 import uuid
+import time
 import requests
 from typing import Dict, Any, Optional
 
@@ -55,11 +56,27 @@ class MollieService:
     def __init__(self) -> None:
         self.runtime_api_key: str = os.environ.get("MOLLIE_API_KEY", "").strip()
 
+    def available_methods(self):
+        if not self.is_live_or_test_key_configured():
+            return [] if os.environ.get("APP_ENV") == "production" else MOLLIE_METHODS
+        if getattr(self, "_methods_until", 0) > time.time():
+            return self._methods_cache
+        try:
+            response = requests.get(f"{MOLLIE_API_BASE}/methods", headers={"Authorization": f"Bearer {self.get_api_key()}"}, params={"locale": "de_AT"}, timeout=8)
+            response.raise_for_status()
+            enabled = {m["id"] for m in response.json().get("_embedded", {}).get("methods", [])}
+            self._methods_cache = [m for m in MOLLIE_METHODS if m["id"] in enabled and m["id"] in {"eps", "creditcard", "paypal", "banktransfer"}]
+            self._methods_until = time.time() + 120
+            return self._methods_cache
+        except requests.RequestException:
+            return []
+
     def get_api_key(self) -> str:
         return self.runtime_api_key or os.environ.get("MOLLIE_API_KEY", "").strip()
 
     def set_api_key(self, api_key: str) -> None:
         self.runtime_api_key = (api_key or "").strip()
+        self._methods_until = 0
 
     def is_live_or_test_key_configured(self) -> bool:
         key = self.get_api_key()
@@ -68,9 +85,9 @@ class MollieService:
     def get_mode_info(self) -> Dict[str, Any]:
         key = self.get_api_key()
         if key.startswith("live_"):
-            return {"mode": "live", "label": "Mollie Live-API aktiv", "has_key": True, "masked_key": key[:8] + "••••••••"}
+            return {"mode": "live", "label": "Mollie Live-API aktiv", "has_key": True, "masked_key": "••••••••"}
         if key.startswith("test_"):
-            return {"mode": "test", "label": "Mollie Test-API aktiv", "has_key": True, "masked_key": key[:8] + "••••••••"}
+            return {"mode": "test", "label": "Mollie Test-API aktiv", "has_key": True, "masked_key": "••••••••"}
         return {
             "mode": "sandbox_simulator",
             "label": "Integrierter Mollie Checkout-Simulator (Kein API-Key erforderlich – Test/Live-Key optional hinterlegbar)",
@@ -97,6 +114,8 @@ class MollieService:
         interaktiv abgeschlossen werden kann.
         """
         api_key = self.get_api_key()
+        if os.environ.get("APP_ENV") == "production" and not api_key.startswith("live_"):
+            raise RuntimeError("Mollie Live-Zahlung ist noch nicht eingerichtet.")
         value_str = f"{amount_eur:.2f}"
 
         if api_key.startswith("test_") or api_key.startswith("live_"):
@@ -108,6 +127,7 @@ class MollieService:
                 "description": description,
                 "redirectUrl": redirect_url,
                 "metadata": metadata,
+                "locale": "de_AT",
             }
             # Webhook nur mitsenden, wenn öffentlich erreichbar (Mollie lehnt localhost-Webhooks ab)
             if webhook_url and not ("localhost" in webhook_url or "127.0.0.1" in webhook_url):
@@ -172,7 +192,6 @@ class MollieService:
             return None
         headers = {"Authorization": f"Bearer {api_key}"}
         resp = requests.get(f"{MOLLIE_API_BASE}/payments/{payment_id}", headers=headers, timeout=10)
-        if resp.status_code == 200:
-            return resp.json()
-        return None
+        resp.raise_for_status()
+        return resp.json()
 

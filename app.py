@@ -6,6 +6,9 @@ und Zahlung über Mollie (Mollie API v2 + interaktiver Mollie Checkout Simulator
 """
 
 import json
+import hashlib
+import hmac
+from decimal import Decimal
 import mimetypes
 import os
 import sqlite3
@@ -27,12 +30,37 @@ from mollie_service import MOLLIE_METHODS, MollieService
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
-DB_PATH = BASE_DIR / "honigautomat.db"
+DB_PATH = Path(os.environ.get("DATABASE_PATH", str(BASE_DIR / "honigautomat.db")))
+PRODUCTION = os.environ.get("APP_ENV") == "production"
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+ORDER_TOKEN_SECRET = os.environ.get("ORDER_TOKEN_SECRET", "")
+
+
+def order_token(order_id: str) -> str:
+    return hmac.new(ORDER_TOKEN_SECRET.encode(), order_id.encode(), hashlib.sha256).hexdigest()
+
+
+def verified_payment_status(order: Dict[str, Any]) -> Optional[str]:
+    payment = mollie_service.fetch_payment_status(order["payment_id"])
+    if not payment:
+        return None
+    if (payment.get("id") != order["payment_id"]
+            or payment.get("amount", {}).get("currency") != "EUR"
+            or Decimal(str(payment.get("amount", {}).get("value", "-1"))) != Decimal(str(order["total_eur"]))
+            or payment.get("metadata", {}).get("order_id") != order["order_id"]
+            or (PRODUCTION and payment.get("mode") != "live")):
+        raise ValueError("Zahlungsdaten stimmen nicht mit der Bestellung überein.")
+    status = payment.get("status")
+    if status not in {"open", "pending", "authorized", "paid", "canceled", "expired", "failed"}:
+        return None
+    return status
+
 
 mollie_service = MollieService()
 
 
 def init_db() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -534,6 +562,12 @@ def render_mollie_simulator_html(order: Dict[str, Any]) -> str:
 class HonigautomatRequestHandler(BaseHTTPRequestHandler):
     server_version = "BienenladenHonigKiste/3.0"
 
+    def end_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        super().end_headers()
+
     def _send_json(self, data: Any, status: int = 200) -> None:
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -566,6 +600,8 @@ class HonigautomatRequestHandler(BaseHTTPRequestHandler):
             return {}
 
     def _base_url(self) -> str:
+        if PUBLIC_BASE_URL:
+            return PUBLIC_BASE_URL
         host = self.headers.get("Host", "localhost:8000")
         proto = self.headers.get("X-Forwarded-Proto", "http")
         return f"{proto}://{host}"
@@ -574,6 +610,14 @@ class HonigautomatRequestHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
 
+        if path == "/healthz":
+            self._send_json({"status": "ok", "production": PRODUCTION})
+            return
+
+        if PRODUCTION and (path in {"/api/orders", "/api/mollie/settings"} or path.startswith("/mollie-checkout/") or path.startswith("/api/configurator/")):
+            self._send_json({"error": "Nicht verfügbar."}, status=404)
+            return
+
         if path == "/api/catalog":
             self._send_json(
                 {
@@ -581,7 +625,9 @@ class HonigautomatRequestHandler(BaseHTTPRequestHandler):
                     "products": PRODUCTS,
                     "configurator": CONFIGURATOR_OPTIONS,
                     "ral_colors": RAL_COLORS,
-                    "mollie_methods": MOLLIE_METHODS,
+                    "mollie_methods": mollie_service.available_methods(),
+                    "production": PRODUCTION,
+                    "checkout_enabled": not PRODUCTION or mollie_service.get_mode_info()["mode"] == "live",
                     "mollie_status": mollie_service.get_mode_info(),
                     "faq": FAQ_ITEMS,
                 }
@@ -629,6 +675,9 @@ class HonigautomatRequestHandler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/orders/"):
             order_id = path.split("/api/orders/", 1)[1].strip()
+            if PRODUCTION and not hmac.compare_digest(self.headers.get("X-Order-Token", ""), order_token(order_id)):
+                self._send_json({"error": "Nicht verfügbar."}, status=404)
+                return
             conn = sqlite3.connect(DB_PATH)
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
@@ -640,23 +689,22 @@ class HonigautomatRequestHandler(BaseHTTPRequestHandler):
                 return
 
             order_dict = dict(row)
-            # Wenn echte Mollie-Zahlung vorliegt, Status live aktualisieren
-            remote = mollie_service.fetch_payment_status(order_dict["payment_id"])
-            if remote and remote.get("status") and remote["status"] != order_dict["payment_status"]:
-                new_status = remote["status"]
+            try:
+                new_status = verified_payment_status(order_dict)
+            except Exception:
+                conn.close()
+                self._send_json({"error": "Zahlungsstatus derzeit nicht abrufbar."}, status=502)
+                return
+            if new_status and new_status != order_dict["payment_status"]:
                 now = datetime.utcnow().isoformat() + "Z"
-                cur.execute(
-                    "UPDATE orders SET payment_status = ?, updated_at = ? WHERE order_id = ?",
-                    (new_status, now, order_id),
-                )
+                cur.execute("UPDATE orders SET payment_status = ?, updated_at = ? WHERE order_id = ?", (new_status, now, order_id))
                 conn.commit()
                 order_dict["payment_status"] = new_status
-                order_dict["updated_at"] = now
             conn.close()
 
             order_dict["customer"] = json.loads(order_dict.pop("customer_json", "{}"))
             order_dict["items"] = json.loads(order_dict.pop("items_json", "[]"))
-            self._send_json(order_dict)
+            self._send_json({key: order_dict[key] for key in ("order_id", "order_number", "payment_status", "total_eur")})
             return
 
         if path.startswith("/mollie-checkout/"):
@@ -676,7 +724,7 @@ class HonigautomatRequestHandler(BaseHTTPRequestHandler):
         # Statische Dateien aus /static ausliefern
         rel_path = "index.html" if path in ("/", "") else path.lstrip("/")
         file_path = (STATIC_DIR / rel_path).resolve()
-        if not str(file_path).startswith(str(STATIC_DIR.resolve())) or not file_path.is_file():
+        if not file_path.is_relative_to(STATIC_DIR.resolve()) or not file_path.is_file():
             file_path = STATIC_DIR / "index.html"
 
         ctype, _ = mimetypes.guess_type(str(file_path))
@@ -689,9 +737,31 @@ class HonigautomatRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self) -> None:
+        try:
+            self._do_POST()
+        except (ValueError, TypeError, AttributeError, KeyError):
+            self._send_json({"error": "Ungültige Anfrage."}, status=400)
+
+    def _do_POST(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
-        body = self._read_body_json()
+        if PRODUCTION and path in {"/api/mollie/settings", "/api/configurator/save"}:
+            self._send_json({"error": "Nicht verfügbar."}, status=404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            if length < 0 or length > 65536:
+                self._send_json({"error": "Anfrage zu groß."}, status=413)
+                return
+            body = self._read_body_json()
+            if not isinstance(body, dict):
+                raise ValueError("Ungültige Anfrage")
+        except (ValueError, TypeError):
+            self._send_json({"error": "Ungültige Anfrage."}, status=400)
+            return
+        if PRODUCTION and self.headers.get("Origin") not in {None, PUBLIC_BASE_URL}:
+            self._send_json({"error": "Ungültiger Ursprung."}, status=403)
+            return
 
         if path == "/api/configurator/calculate":
             calc = calculate_configuration(body)
@@ -723,16 +793,37 @@ class HonigautomatRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/orders/checkout":
+            if PRODUCTION and mollie_service.get_mode_info()["mode"] != "live":
+                self._send_json({"error": "Onlinezahlung wird eingerichtet. Bitte kontaktiere den Bienenladen."}, status=503)
+                return
             customer = body.get("customer") or {}
+            if not isinstance(customer, dict):
+                self._send_json({"error": "Ungültige Kundendaten."}, status=400)
+                return
+            if PRODUCTION:
+                fields = ("name", "email", "street", "city", "phone", "country")
+                if any(not isinstance(customer.get(key), str) or not customer[key].strip() or len(customer[key]) > 500 for key in fields) or "@" not in customer["email"] or customer["country"] != "AT":
+                    self._send_json({"error": "Bitte prüfe deine Kontakt- und Adressdaten."}, status=400)
+                    return
+                if customer.get("accept_terms") != "yes":
+                    self._send_json({"error": "Bitte bestätige AGB und Widerrufsbelehrung."}, status=400)
+                    return
+                customer = {key: customer[key].strip() for key in fields} | {"accept_terms": "yes", "terms_url": "https://www.bienenladen.at/de/agb", "withdrawal_url": "https://www.bienenladen.at/de/widerrufsbelehrung", "accepted_at": datetime.utcnow().isoformat() + "Z"}
             name = str(customer.get("name", "")).strip()
             email = str(customer.get("email", "")).strip()
             if not name or not email:
                 self._send_json({"error": "Bitte gib deinen Namen und deine E-Mail-Adresse an."}, status=400)
                 return
 
+            if not isinstance(customer, dict):
+                self._send_json({"error": "Ungültige Kundendaten."}, status=400)
+                return
             payment_method = str(body.get("payment_method", "eps")).strip() or "eps"
+            if payment_method not in {m["id"] for m in mollie_service.available_methods()}:
+                self._send_json({"error": "Zahlungsart nicht verfügbar."}, status=400)
+                return
             cart_items = body.get("items") or []
-            if not cart_items:
+            if not isinstance(cart_items, list) or not cart_items or len(cart_items) > 100 or any(not isinstance(x, dict) or type(x.get("quantity", 1)) is not int or not 1 <= x.get("quantity", 1) <= 20 for x in cart_items):
                 self._send_json({"error": "Der Warenkorb ist leer."}, status=400)
                 return
 
@@ -794,10 +885,12 @@ class HonigautomatRequestHandler(BaseHTTPRequestHandler):
             total_eur = round(subtotal_eur + shipping_eur, 2)
             vat_eur = round(total_eur - (total_eur / 1.20), 2)
 
-            order_id = uuid.uuid4().hex[:12]
+            order_id = uuid.uuid4().hex
             order_number = f"BL-{datetime.utcnow().strftime('%Y%m%d')}-{order_id[:4].upper()}"
             base_url = self._base_url()
             redirect_url = f"{base_url}/?order={order_id}"
+            if PRODUCTION:
+                redirect_url += f"#token={order_token(order_id)}"
             webhook_url = f"{base_url}/api/mollie/webhook"
 
             description = f"Der Bienenladen × Honig-Kiste.de | Bestellung {order_number}"
@@ -813,8 +906,8 @@ class HonigautomatRequestHandler(BaseHTTPRequestHandler):
                     base_url=base_url,
                     metadata={"order_id": order_id, "order_number": order_number},
                 )
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=502)
+            except Exception:
+                self._send_json({"error": "Zahlung konnte nicht angelegt werden. Bitte versuche es später erneut."}, status=502)
                 return
 
             now = datetime.utcnow().isoformat() + "Z"
@@ -872,30 +965,38 @@ class HonigautomatRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "Missing payment id"}, status=400)
                 return
 
-            new_status = explicit_status
-            if not new_status:
-                remote = mollie_service.fetch_payment_status(payment_id)
-                if remote and remote.get("status"):
-                    new_status = remote["status"]
-
-            if new_status:
-                now = datetime.utcnow().isoformat() + "Z"
-                conn = sqlite3.connect(DB_PATH)
-                cur = conn.cursor()
-                cur.execute(
-                    "UPDATE orders SET payment_status = ?, updated_at = ? WHERE payment_id = ?",
-                    (new_status, now, payment_id),
-                )
-                conn.commit()
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM orders WHERE payment_id = ?", (payment_id,)).fetchone()
+            if not row:
                 conn.close()
-
-            self._send_json({"received": True, "payment_id": payment_id, "status": new_status or "unchanged"})
+                self._send_json({"received": True})
+                return
+            try:
+                if mollie_service.is_live_or_test_key_configured():
+                    new_status = verified_payment_status(dict(row))
+                elif not PRODUCTION and payment_id.startswith("tr_sim_"):
+                    new_status = explicit_status if explicit_status in {"paid", "canceled", "failed"} else None
+                else:
+                    new_status = None
+                if new_status:
+                    conn.execute("UPDATE orders SET payment_status = ?, updated_at = ? WHERE payment_id = ?", (new_status, datetime.utcnow().isoformat() + "Z", payment_id))
+                    conn.commit()
+            except Exception:
+                self._send_json({"error": "Zahlungsprüfung vorübergehend fehlgeschlagen."}, status=503)
+                return
+            finally:
+                conn.close()
+            self._send_json({"received": True})
             return
 
         self._send_json({"error": "Unbekannter Endpunkt"}, status=404)
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
+    if PRODUCTION:
+        if not PUBLIC_BASE_URL.startswith("https://") or len(ORDER_TOKEN_SECRET) < 32:
+            raise RuntimeError("PUBLIC_BASE_URL (HTTPS) und ORDER_TOKEN_SECRET fehlen.")
     init_db()
     server = ThreadingHTTPServer((host, port), HonigautomatRequestHandler)
     print(f"🐝 Der Bienenladen × Honig-Kiste.de Webapp läuft auf http://{host}:{port}")
@@ -909,5 +1010,5 @@ def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
 
 if __name__ == "__main__":
     port_env = int(os.environ.get("PORT", "8000"))
-    run_server(port=port_env)
+    run_server(host=os.environ.get("HOST", "0.0.0.0"), port=port_env)
 
